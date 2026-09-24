@@ -5460,7 +5460,7 @@ def resolve_provider_client(
 
 def get_text_auxiliary_client(task: str = "", *, main_runtime: Optional[Dict[str, Any]] = None) -> Tuple[Optional[OpenAI], Optional[str]]:
     """Return (client, default_model_slug) for text-only aux tasks; ``task`` selects auxiliary.<task> overrides."""
-    provider, model, base_url, api_key, api_mode = _resolve_task_provider_model(task or None)
+    provider, model, base_url, api_key, api_mode = _resolve_task_provider_model(task or None, main_runtime=main_runtime)
     return resolve_provider_client(
         provider, model=model, explicit_base_url=base_url, explicit_api_key=api_key,
         api_mode=api_mode, main_runtime=main_runtime,
@@ -6041,19 +6041,69 @@ def _preserve_provider_with_base_url(prov: Optional[str]) -> bool:
         }
 
 
+# ── Conditional compression route (auxiliary.compression.local_override) ──
+# When the live session's main model is served from one of the listed LAN
+# endpoints, the compression task config swaps its routing fields to the
+# ``local_override`` block (e.g. an OpenRouter preset), so summarising a long
+# local conversation does not occupy the local GPU. The main runtime is read
+# per call (never cached) so /model switches and concurrent sessions cannot
+# inherit a stale route. Without the block — or when it doesn't match —
+# compression resolves exactly as before.
+_COMPRESSION_OVERRIDE_FIELDS = (
+    "provider", "model", "base_url", "api_key", "api_mode", "key_env", "api_key_env",
+)
+
+
+def _compression_local_override_matches(main_runtime: Dict[str, Any], override: Dict[str, Any]) -> bool:
+    """True when the main runtime's base_url equals one of ``override.base_urls``."""
+    main_url = str(main_runtime.get("base_url") or "").strip().rstrip("/")
+    if not main_url:
+        return False
+    listed = override.get("base_urls")
+    if not isinstance(listed, list):
+        return False
+    candidates = {
+        str(url).strip().rstrip("/") for url in listed
+        if isinstance(url, str) and str(url).strip()
+    }
+    return main_url in candidates
+
+
+def _apply_compression_local_override(
+    task_config: Dict[str, Any], main_runtime: Optional[Dict[str, Any]]
+) -> Dict[str, Any]:
+    """Merge ``auxiliary.compression.local_override`` routing fields into the
+    compression task config when the main model runs on a listed LAN endpoint."""
+    override = task_config.get("local_override")
+    if not isinstance(override, dict) or not override:
+        return task_config
+    runtime = _normalize_main_runtime(main_runtime)
+    if not _compression_local_override_matches(runtime, override):
+        return task_config
+    merged = dict(task_config)
+    for field in _COMPRESSION_OVERRIDE_FIELDS:
+        if field in override:
+            merged[field] = override[field]
+    return merged
+
+
 def _resolve_task_provider_model(
     task: str = None, provider: str = None, model: str = None, base_url: Optional[str] = None,
-    api_key: Optional[str] = None,
+    api_key: Optional[str] = None, *,
+    main_runtime: Optional[Dict[str, Any]] = None,
 ) -> Tuple[str, Optional[str], Optional[str], Optional[str], Optional[str]]:
     """Determine (provider, model, base_url, api_key, api_mode) for a call.
 
     Priority: explicit args > config auxiliary.{task}.* > "auto". A bare base_url means custom,
     but a first-class provider + base_url keeps the provider identity so its auth/transport
     shaping still applies. api_mode is "chat_completions", "codex_responses", or None (auto).
+    ``main_runtime`` scopes ``auxiliary.compression.local_override`` to the live session route.
     """
     cfg_provider = cfg_model = cfg_base_url = cfg_api_key = resolved_api_mode = None
     if task:
         task_config = _get_auxiliary_task_config(task)
+        if task == "compression":
+            task_config = _apply_compression_local_override(task_config, main_runtime)
         cfg_provider = str(task_config.get("provider", "")).strip() or None
         cfg_model = str(task_config.get("model", "")).strip() or None
         cfg_base_url = str(task_config.get("base_url", "")).strip() or None
@@ -7285,7 +7335,7 @@ def _prepare_aux_request(
     Sync-only: compression fast lane, per-request ``extra_headers``, and ``base_info`` falling
     back to the resolved base_url when the client exposes none."""
     resolved_provider, resolved_model, resolved_base_url, resolved_api_key, resolved_api_mode = _resolve_task_provider_model(
-        task, provider, model, base_url, api_key)
+        task, provider, model, base_url, api_key, main_runtime=main_runtime)
     if api_mode:
         resolved_api_mode = api_mode
     effective_extra_body = _get_task_extra_body(task)
@@ -8209,7 +8259,7 @@ def get_async_text_auxiliary_client(task: str = "", *, main_runtime: Optional[Di
     (AsyncCodexAuxiliaryClient, model) which wraps the Responses API.
     Returns (None, None) when no provider is available.
     """
-    provider, model, base_url, api_key, api_mode = _resolve_task_provider_model(task or None)
+    provider, model, base_url, api_key, api_mode = _resolve_task_provider_model(task or None, main_runtime=main_runtime)
     return resolve_provider_client(
         provider,
         model=model,
